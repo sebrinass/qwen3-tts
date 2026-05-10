@@ -136,17 +136,16 @@ static void qwen_encoder_transformer_free(QwenEncoderTransformer * tr) {
     }
 }
 
-// Build a [T, T] additive mask (0 where allowed, -inf where masked)
-// for a causal sliding window of width `window`. Allowed when k <= q
-// and (q - k) < window.
-static void qwen_encoder_build_causal_sliding_mask(int T, int window, std::vector<float> & dst) {
+// Build a [T, T] additive causal mask (0 where allowed, -inf where masked).
+// Pure causal : k <= q. Even though the upstream config carries a
+// sliding_window field, MimiAttention's eager forward does not apply it
+// (only the eager attention_mask is used) and MimiTransformerModel calls
+// create_causal_mask() which is non-sliding. The Qwen3TTS encoder side
+// inherits this convention, so we mirror it bit for bit here.
+static void qwen_encoder_build_causal_mask(int T, std::vector<float> & dst) {
     dst.assign((size_t) T * (size_t) T, -INFINITY);
     for (int q = 0; q < T; q++) {
-        int k_min = q - window + 1;
-        if (k_min < 0) {
-            k_min = 0;
-        }
-        for (int k = k_min; k <= q; k++) {
+        for (int k = 0; k <= q; k++) {
             dst[(size_t) q * (size_t) T + (size_t) k] = 0.0f;
         }
     }

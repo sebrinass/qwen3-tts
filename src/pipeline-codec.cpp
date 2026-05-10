@@ -220,8 +220,10 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
     return audio;
 }
 
-std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc, const float * audio, int n_samples,
-                                           const char * dump_dir) {
+std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
+                                           const float *   audio,
+                                           int             n_samples,
+                                           const char *    dump_dir) {
     if (n_samples <= 0 || (n_samples % QWEN_TOKENIZER_HOP_LENGTH) != 0) {
         qt_log(QT_LOG_ERROR, "[Pipeline] n_samples must be a positive multiple of %d (got %d)",
                QWEN_TOKENIZER_HOP_LENGTH, n_samples);
@@ -271,14 +273,13 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc, const float * aud
     struct ggml_tensor * sn_stage1_t  = NULL;
     struct ggml_tensor * sn_stage3_t  = NULL;
     struct ggml_tensor * h_seanet =
-        qwen_seanet_encoder_forward(gctx, &pc->seanet, audio_in,
-                                    &sn_init_t, &sn_resnet0_t, &sn_stage0_t,
-                                    &sn_stage1_t, &sn_stage3_t);  // [T_emb, 512]
-    struct ggml_tensor * h        = ggml_cont(gctx, ggml_transpose(gctx, h_seanet));           // [512, T_emb]
+        qwen_seanet_encoder_forward(gctx, &pc->seanet, audio_in, &sn_init_t, &sn_resnet0_t, &sn_stage0_t, &sn_stage1_t,
+                                    &sn_stage3_t);                                         // [T_emb, 512]
+    struct ggml_tensor * h = ggml_cont(gctx, ggml_transpose(gctx, h_seanet));              // [512, T_emb]
     struct ggml_tensor * h_et =
-        qwen_encoder_transformer_forward(gctx, &pc->enc_transformer, h, positions, mask);      // [512, T_emb]
-    h = ggml_cont(gctx, ggml_transpose(gctx, h_et));                                           // [T_emb, 512]
-    h = qwen_encoder_downsample_forward(gctx, &pc->enc_downsample, h);                         // [T, 512]
+        qwen_encoder_transformer_forward(gctx, &pc->enc_transformer, h, positions, mask);  // [512, T_emb]
+    h = ggml_cont(gctx, ggml_transpose(gctx, h_et));                                       // [T_emb, 512]
+    h = qwen_encoder_downsample_forward(gctx, &pc->enc_downsample, h);                     // [T, 512]
 
     // The CPU RVQ encode loop expects the hidden buffer as [T, hidden]
     // row-major (hidden fast in memory). The downsample output ne=(T, 512)
@@ -286,7 +287,7 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc, const float * aud
     // Transpose to get the buffer layout we want once read back to host.
     h = ggml_cont(gctx, ggml_transpose(gctx, h));  // ne=(512, T)
 
-    const char * dump = dump_dir;
+    const char *         dump            = dump_dir;
     struct ggml_tensor * h_seanet_dump   = NULL;
     struct ggml_tensor * sn_init_dump    = NULL;
     struct ggml_tensor * sn_resnet0_dump = NULL;
@@ -371,7 +372,7 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc, const float * aud
     ggml_backend_tensor_set(positions, pos_buf.data(), 0, pos_buf.size() * sizeof(int32_t));
 
     std::vector<float> mask_buf;
-    qwen_encoder_build_causal_sliding_mask(T_emb, pc->enc_transformer.sliding_window, mask_buf);
+    qwen_encoder_build_causal_mask(T_emb, mask_buf);
     ggml_backend_tensor_set(mask, mask_buf.data(), 0, mask_buf.size() * sizeof(float));
 
     enum ggml_status st = ggml_backend_sched_graph_compute(pc->sched, graph);
@@ -399,14 +400,24 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc, const float * aud
             ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
             debug_dump_2d(&d, name, buf.data(), (int) t->ne[1], (int) t->ne[0]);
         };
-        dump2("seanet-out",          h_seanet_dump);
+        dump2("seanet-out", h_seanet_dump);
         dump2("enc-transformer-out", h_et);
-        dump2("codec-pre-fsq",       h);
-        if (sn_init_dump)    { dump2("seanet-init",    sn_init_dump);    }
-        if (sn_resnet0_dump) { dump2("seanet-resnet0", sn_resnet0_dump); }
-        if (sn_stage0_dump)  { dump2("seanet-stage0",  sn_stage0_dump);  }
-        if (sn_stage1_dump)  { dump2("seanet-stage1",  sn_stage1_dump);  }
-        if (sn_stage3_dump)  { dump2("seanet-stage3",  sn_stage3_dump);  }
+        dump2("codec-pre-fsq", h);
+        if (sn_init_dump) {
+            dump2("seanet-init", sn_init_dump);
+        }
+        if (sn_resnet0_dump) {
+            dump2("seanet-resnet0", sn_resnet0_dump);
+        }
+        if (sn_stage0_dump) {
+            dump2("seanet-stage0", sn_stage0_dump);
+        }
+        if (sn_stage1_dump) {
+            dump2("seanet-stage1", sn_stage1_dump);
+        }
+        if (sn_stage3_dump) {
+            dump2("seanet-stage3", sn_stage3_dump);
+        }
     }
 
     // Read back the post-downsample hidden buffer for CPU-side RVQ encode.
