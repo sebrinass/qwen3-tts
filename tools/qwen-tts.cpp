@@ -258,7 +258,7 @@ static int run(const Args & a) {
     int                                      ref_n_samples = 0;
     if (a.ref_wav) {
         int     T_in = 0;
-        float * raw  = audio_read_mono(a.ref_wav, QT_CODEC_SAMPLE_RATE, &T_in);
+        float * raw  = audio_read_mono(a.ref_wav, 24000, &T_in);
         if (!raw || T_in <= 0) {
             fprintf(stderr, "[CLI] ERROR: cannot read --ref-wav '%s'\n", a.ref_wav);
             if (raw) {

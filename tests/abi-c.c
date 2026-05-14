@@ -81,10 +81,6 @@ int main(void) {
         fprintf(stderr, "[Probe] init_params defaults do not match (use_fa=true, clamp_fp16=false)\n");
         return 1;
     }
-    if (QT_CODEC_SAMPLE_RATE != 24000) {
-        fprintf(stderr, "[Probe] QT_CODEC_SAMPLE_RATE is not 24000\n");
-        return 1;
-    }
 
     /* Touch every reference-pointer field, every callback typedef and
      * every output struct field so the compiler validates the layout

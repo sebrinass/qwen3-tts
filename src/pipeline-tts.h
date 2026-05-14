@@ -154,6 +154,6 @@ qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
                                   struct qt_audio *            out);
 
 // Convert a duration in seconds to a frame count at the codec frame
-// rate (QT_CODEC_SAMPLE_RATE / TOKENIZER_HOP_LENGTH). Clamps to a
+// rate (24000 / TOKENIZER_HOP_LENGTH). Clamps to a
 // minimum of one frame.
 int pipeline_tts_duration_sec_to_tokens(const PipelineTTS * pt, float duration_sec);

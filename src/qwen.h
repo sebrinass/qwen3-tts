@@ -59,13 +59,6 @@ extern "C" {
 // matters.
 #define QT_ABI_VERSION 1
 
-// Codec sample rate. The 12 Hz Qwen3-TTS audio tokenizer always produces
-// 24 kHz mono PCM through its DAC v2 decoder. Exposed at the ABI so a
-// caller that needs to resample a reference WAV before passing it via
-// qt_tts_params.ref_audio_24k can do so without pulling in any internal
-// header. The constant is immutable for this model family.
-#define QT_CODEC_SAMPLE_RATE 24000
-
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
 // thread, no allocation. Pointer stays valid for the process lifetime.
@@ -101,7 +94,7 @@ QT_API const char * qt_last_error(void);
 struct qt_audio {
     float * samples;      // mono PCM, malloc allocated
     int     n_samples;    // length in samples
-    int     sample_rate;  // QT_CODEC_SAMPLE_RATE (24000)
+    int     sample_rate;  // 24000 (codec rate)
     int     channels;     // 1 (mono)
 };
 
@@ -156,7 +149,7 @@ typedef bool (*qt_cancel_cb)(void * user_data);
 // accumulated into the `out` buffer of qt_synthesize. Returning false
 // aborts the synthesis with QT_STATUS_CANCELLED, identical to the
 // qt_cancel_cb behaviour. The samples pointer is mono float PCM at
-// QT_CODEC_SAMPLE_RATE; valid only for the duration of the call.
+// 24 kHz; valid only for the duration of the call.
 // user_data is forwarded verbatim from on_chunk_user_data.
 //
 // The chunk granularity is driven by chunk_duration_sec in qt_tts_params:
@@ -218,7 +211,7 @@ struct qt_tts_params {
     // Optional voice reference for base mode voice cloning. Mode A
     // (x_vector_only) sets ref_audio_24k only; mode B (ICL) sets
     // both ref_audio_24k and ref_text. ref_audio_24k is a mono float
-    // PCM buffer sampled at QT_CODEC_SAMPLE_RATE. Mutually exclusive
+    // PCM buffer sampled at 24 kHz. Mutually exclusive
     // with speaker. Rejected for custom_voice / voice_design.
     const float * ref_audio_24k;
     int           ref_n_samples;
@@ -272,7 +265,7 @@ QT_API void qt_tts_default_params(struct qt_tts_params * p);
 // Run the full TTS synthesis. Validates the params against the loaded
 // model_type (the seven base / custom_voice / voice_design rules),
 // resolves the seed, hands off to pipeline_tts_synthesize and fills
-// `out` with mono float PCM at QT_CODEC_SAMPLE_RATE in buffered mode.
+// `out` with mono float PCM at 24 kHz in buffered mode.
 // In streaming mode (params->on_chunk != NULL), audio is emitted
 // through the callback and `out` stays empty. Returns QT_STATUS_OK on
 // success; on any failure returns a negative qt_status describing the
@@ -280,7 +273,7 @@ QT_API void qt_tts_default_params(struct qt_tts_params * p);
 QT_API enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params * params, struct qt_audio * out);
 
 // Convert a duration in seconds to a frame count using the codec
-// frame rate (QT_CODEC_SAMPLE_RATE / TOKENIZER_HOP_LENGTH = 12.5 Hz).
+// frame rate (24000 / TOKENIZER_HOP_LENGTH = 12.5 Hz).
 // Clamps to a minimum of one frame.
 QT_API int qt_duration_sec_to_tokens(const struct qt_context * q, float duration_sec);
 
