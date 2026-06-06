@@ -494,7 +494,8 @@ Required:
   -o <path>               Output WAV (24 kHz mono). '-' streams to stdout (pipe friendly).
 
 Input:
-  stdin                   Target text to synthesise. Read fully then synthesised in one shot.
+  stdin                   Target text to synthesise. Read fully then synthesised in one
+                          shot, or line by line with --stream-by-line.
 
 Optional:
   --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)
@@ -507,6 +508,7 @@ Optional:
   --max-new <n>           Max new audio frames (default: 2048)
   --codec-chunk-dur <f>   Codec decode chunk duration in seconds (default: 24.0)
   --codec-left-dur <f>    Codec decode left context duration in seconds (default: 2.0)
+  --stream-by-line        Flush synthesis at each newline, one WAV header per line (-o '-')
 
 Sampling:
   --seed <int>            Sampling seed (default: -1 for random)

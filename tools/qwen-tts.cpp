@@ -31,7 +31,8 @@ static void print_usage(const char * prog) {
             "  --codec <gguf>          Codec GGUF (qwen-tokenizer-*.gguf)\n"
             "  -o <path>               Output WAV (24 kHz mono). '-' streams to stdout (pipe friendly).\n\n"
             "Input:\n"
-            "  stdin                   Target text to synthesise. Read fully then synthesised in one shot.\n\n"
+            "  stdin                   Target text to synthesise. Read fully then synthesised in one\n"
+            "                          shot, or line by line with --stream-by-line.\n\n"
             "Optional:\n"
             "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n"
             "  --lang <name>           Language label (default: auto)\n"
@@ -42,7 +43,8 @@ static void print_usage(const char * prog) {
             "  --ref-text <path>       Transcript file for the reference (enables ICL clone mode)\n"
             "  --max-new <n>           Max new audio frames (default: 2048)\n"
             "  --codec-chunk-dur <f>   Codec decode chunk duration in seconds (default: 24.0)\n"
-            "  --codec-left-dur <f>    Codec decode left context duration in seconds (default: 2.0)\n\n"
+            "  --codec-left-dur <f>    Codec decode left context duration in seconds (default: 2.0)\n"
+            "  --stream-by-line        Flush synthesis at each newline, one WAV header per line (-o '-')\n\n"
             "Sampling:\n"
             "  --seed <int>            Sampling seed (default: -1 for random)\n"
             "  --greedy                Disable stochastic sampling on both stacks\n"
@@ -84,6 +86,7 @@ struct Args {
     bool         subtalker_do_sample;
     bool         use_fa;
     bool         clamp_fp16;
+    bool         stream_by_line;
     float        codec_chunk_sec;
     float        codec_left_context_sec;
 };
@@ -145,6 +148,7 @@ static bool parse_args(int argc, char ** argv, Args & a) {
     a.subtalker_temperature  = 0.9f;
     a.use_fa                 = true;
     a.clamp_fp16             = false;
+    a.stream_by_line         = false;
     a.codec_chunk_sec        = 24.0f;
     a.codec_left_context_sec = 2.0f;
     for (int i = 1; i < argc; i++) {
@@ -200,6 +204,8 @@ static bool parse_args(int argc, char ** argv, Args & a) {
             a.use_fa = false;
         } else if (std::strcmp(arg, "--clamp-fp16") == 0) {
             a.clamp_fp16 = true;
+        } else if (std::strcmp(arg, "--stream-by-line") == 0) {
+            a.stream_by_line = true;
         } else if (std::strcmp(arg, "--codec-chunk-dur") == 0 && i + 1 < argc) {
             a.codec_chunk_sec = (float) std::atof(argv[++i]);
         } else if (std::strcmp(arg, "--codec-left-dur") == 0 && i + 1 < argc) {
@@ -281,15 +287,28 @@ static int run(const Args & a) {
         return 1;
     }
 
+    // Streaming detection : -o '-' writes a wide RIFF header to stdout
+    // up front and pipes encoded samples chunk by chunk through the
+    // on_chunk callback as the AR loop produces frames. Any other path
+    // (or no -o) takes the buffered route so the file gets accurate
+    // sizes in its header.
+    const char * out_path         = a.out_wav ? a.out_wav : "out.wav";
+    const bool   stream_to_stdout = (out_path[0] == '-' && out_path[1] == '\0');
+    const bool   line_mode        = a.stream_by_line && stream_to_stdout;
+
     // Resolve utterance text: read stdin fully. Empty stdin triggers a
     // clean error. Inline text on the command line is intentionally not
     // supported: shell quoting and special characters belong in a file
-    // or piped input, never in argv.
-    std::string text_buf = read_stdin_text();
-    if (text_buf.empty()) {
-        fprintf(stderr, "[CLI] ERROR: stdin is empty, nothing to synthesise\n");
-        qt_free(q);
-        return 1;
+    // or piped input, never in argv. Line mode reads stdin line by line
+    // in the streaming loop below instead.
+    std::string text_buf;
+    if (!line_mode) {
+        text_buf = read_stdin_text();
+        if (text_buf.empty()) {
+            fprintf(stderr, "[CLI] ERROR: stdin is empty, nothing to synthesise\n");
+            qt_free(q);
+            return 1;
+        }
     }
     const char * text = text_buf.c_str();
 
@@ -319,14 +338,6 @@ static int run(const Args & a) {
     params.codec_chunk_sec        = a.codec_chunk_sec;
     params.codec_left_context_sec = a.codec_left_context_sec;
 
-    // Streaming detection : -o '-' writes a wide RIFF header to stdout
-    // up front and pipes encoded samples chunk by chunk through the
-    // on_chunk callback as the AR loop produces frames. Any other path
-    // (or no -o) takes the buffered route so the file gets accurate
-    // sizes in its header.
-    const char * out_path         = a.out_wav ? a.out_wav : "out.wav";
-    const bool   stream_to_stdout = (out_path[0] == '-' && out_path[1] == '\0');
-
     if (stream_to_stdout) {
         wav_stream ws = {};
         if (!wav_stream_open_stdout(&ws, 24000, wav_fmt)) {
@@ -337,6 +348,66 @@ static int run(const Args & a) {
             return wav_stream_write((wav_stream *) ud, s, n);
         };
         params.on_chunk_user_data = &ws;
+
+        if (line_mode) {
+            // Line oriented streaming: every stdin line synthesises
+            // immediately as its own utterance, model and speaker staying
+            // resident across lines. Each utterance after the first opens
+            // with a fresh RIFF header so a client can split the stream
+            // into one standalone WAV per line on the RIFF magic. The
+            // header is armed when a line completes and consumed lazily at
+            // the next synthesis, so empty lines and a trailing newline
+            // never emit an orphan header. Lines are text, an embedded NUL
+            // truncates the read at strlen.
+            char        buf[4096];
+            std::string line;
+            bool        need_header = false;
+            int         n_lines     = 0;
+#if defined(_WIN32)
+            _setmode(_fileno(stdin), _O_BINARY);
+#endif
+            while (true) {
+                const bool eof = (fgets(buf, sizeof(buf), stdin) == nullptr);
+                if (!eof) {
+                    line += buf;
+                }
+                const bool complete = !line.empty() && line.back() == '\n';
+                if (complete || (eof && !line.empty())) {
+                    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+                        line.pop_back();
+                    }
+                    if (!line.empty()) {
+                        if (need_header) {
+                            if (!wav_stream_write_header(&ws)) {
+                                qt_free(q);
+                                return 1;
+                            }
+                            need_header = false;
+                        }
+                        params.text      = line.c_str();
+                        qt_audio  audio  = {};
+                        qt_status status = qt_synthesize(q, &params, &audio);
+                        qt_audio_free(&audio);
+                        if (status != QT_STATUS_OK) {
+                            fprintf(stderr, "[CLI] ERROR: %s\n", qt_last_error());
+                            wav_stream_close(&ws);
+                            qt_free(q);
+                            return 1;
+                        }
+                        n_lines++;
+                        need_header = true;
+                    }
+                    line.clear();
+                }
+                if (eof) {
+                    break;
+                }
+            }
+            wav_stream_close(&ws);
+            qt_free(q);
+            fprintf(stderr, "[Pipeline] Streamed %d lines to <stdout>\n", n_lines);
+            return 0;
+        }
 
         qt_audio  audio  = {};
         qt_status status = qt_synthesize(q, &params, &audio);
