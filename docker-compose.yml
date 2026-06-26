@@ -1,0 +1,23 @@
+# Qwen3-TTS Server (Vulkan backend, Intel iGPU)
+#
+# Replace "your-github-username" with the GitHub account that owns the GHCR
+# image, or build locally and change the image to a local tag.
+services:
+  qwen3-tts:
+    image: ghcr.io/sebrinass/qwen3-tts:latest
+    container_name: qwen3-tts
+    ports:
+      - "8080:8080"
+    # Intel iGPU Vulkan render nodes (DRI). Safe to drop on non-Intel hosts
+    # or when running CPU-only.
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ./models:/app/models
+      - ./voices:/app/voices
+    environment:
+      - TALKER_MODEL=/app/models/qwen-talker-0.6b-base-Q8_0.gguf
+      - CODEC_MODEL=/app/models/qwen-tokenizer-12hz-Q8_0.gguf
+      - VOICES_DIR=/app/voices
+      - PORT=8080
+    restart: unless-stopped

@@ -1,0 +1,8 @@
+.git
+build/
+*.gguf
+*.wav
+*.spk
+*.rvq
+tests/
+examples/
