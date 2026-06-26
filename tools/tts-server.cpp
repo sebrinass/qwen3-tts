@@ -579,11 +579,16 @@ int main(int argc, char ** argv) {
                 load_txt_file(voice_path(voices_dir, req.voice, ".txt"), ref_text_buf);
                 p.ref_spk_emb = spk_emb.data();
                 p.ref_spk_dim = (int) spk_emb.size();
-                p.ref_codes   = codes.data();
-                p.ref_T       = ref_T;
                 if (!ref_text_buf.empty()) {
-                    p.ref_text = ref_text_buf.c_str();
+                    // Mode B (ICL) : use the cached RVQ codes + transcript for
+                    // higher quality cloning. Skipping ref_codes when no
+                    // ref_text exists avoids a pipeline assertion.
+                    p.ref_codes = codes.data();
+                    p.ref_T     = ref_T;
+                    p.ref_text  = ref_text_buf.c_str();
                 }
+                // Mode A (x-vector only) : the speaker embedding alone is
+                // enough for a basic clone when no ref_text was provided.
                 voice_resolved = true;
             }
 
