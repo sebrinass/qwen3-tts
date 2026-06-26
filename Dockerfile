@@ -50,11 +50,11 @@ RUN cmake -B build -DGGML_VULKAN=ON \
 # may emit in DL mode. ggml_backend_load_all() searches for backends next
 # to the executable, so they must ship in the same directory at runtime.
 #
-# Libraries are placed in subdirectories like build/ggml/src/ggml-cpu/,
-# build/ggml/src/ggml-vulkan/, build/ggml/src/ggml-base/ etc., so we have
-# to walk the full tree. `cp -P` preserves symlinks so the SONAME aliases
-# (libggml.so.0 -> libggml.so.0.15.2) survive intact — otherwise the
-# dynamic linker can't find libggml.so.0 at runtime.
+# Libraries live in subdirectories like build/ggml/src/ggml-cpu/,
+# build/ggml/src/ggml-vulkan/, build/ggml/src/ggml-base/ etc., so we walk
+# the full tree. `cp -P` preserves symlinks so the SONAME aliases
+# (libggml.so.0 -> libggml.so.0.15.2) survive intact - otherwise the
+# dynamic linker cannot find libggml.so.0 at runtime.
 RUN mkdir -p /out \
     && cp -P build/tts-server /out/ \
     && find build \( -type f -o -type l \) \( -name "*.so" -o -name "*.so.*" \) \
@@ -67,13 +67,16 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime Vulkan stack:
-#   libvulkan1           - Vulkan loader
-#   mesa-vulkan-drivers  - Intel (ANV) + AMD (RADV) Vulkan ICDs (this is the
-#                          actual Intel iGPU Vulkan driver used for compute)
-#   vulkan-tools         - vulkaninfo for debugging (optional)
-#   intel-media-va-driver- Intel iGPU media (VAAPI) support
+# Runtime dependencies. tts-server is built with OpenMP enabled (-fopenmp)
+# and the ggml backends rely on dynamic linking, so the runtime image needs:
+#   libgomp1            - GCC OpenMP runtime (libgomp.so.1)
+#   libvulkan1          - Vulkan loader
+#   mesa-vulkan-drivers - Intel (ANV) + AMD (RADV) Vulkan ICDs (the actual
+#                         Intel iGPU Vulkan driver used for compute)
+#   vulkan-tools        - vulkaninfo for debugging (optional)
+#   intel-media-va-driver - Intel iGPU media (VAAPI) support
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 \
         libvulkan1 \
         mesa-vulkan-drivers \
         vulkan-tools \
