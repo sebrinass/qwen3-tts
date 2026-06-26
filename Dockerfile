@@ -14,11 +14,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         python3 \
         libvulkan-dev \
-        libspirv-dev \
         spirv-tools \
         glslang-tools \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 22.04's spirv-headers apt package ships only headers, not the
+# SPIRV-HeadersConfig.cmake that ggml-vulkan's find_package(SPIRV-Headers
+# CONFIG REQUIRED) needs. Install from source so cmake can locate it.
+RUN git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers \
+    && cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build \
+    && cmake --install /tmp/spirv-headers/build \
+    && rm -rf /tmp/spirv-headers
 
 # Clone the project and initialize the ggml submodule. The build adds ggml
 # as a CMake subdirectory, so the submodule must be present. --depth 1 is
