@@ -14,6 +14,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         python3 \
         libvulkan-dev \
+        libspirv-dev \
+        spirv-tools \
+        glslang-tools \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
