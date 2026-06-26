@@ -3,7 +3,7 @@
 # ============================================================================
 # Build stage: compile the tts-server target with the Vulkan backend
 # ============================================================================
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -56,7 +56,7 @@ RUN mkdir -p /out \
 # ============================================================================
 # Runtime stage
 # ============================================================================
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
