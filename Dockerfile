@@ -49,9 +49,16 @@ RUN cmake -B build -DGGML_VULKAN=ON \
 # Stage a clean /out holding the binary plus any backend shared objects ggml
 # may emit in DL mode. ggml_backend_load_all() searches for backends next
 # to the executable, so they must ship in the same directory at runtime.
+#
+# Libraries are placed in subdirectories like build/ggml/src/ggml-cpu/,
+# build/ggml/src/ggml-vulkan/, build/ggml/src/ggml-base/ etc., so we have
+# to walk the full tree. `cp -P` preserves symlinks so the SONAME aliases
+# (libggml.so.0 -> libggml.so.0.15.2) survive intact — otherwise the
+# dynamic linker can't find libggml.so.0 at runtime.
 RUN mkdir -p /out \
-    && cp build/tts-server /out/ \
-    && find build -maxdepth 1 -type f -name "*.so*" -exec cp -L {} /out/ \;
+    && cp -P build/tts-server /out/ \
+    && find build \( -type f -o -type l \) \( -name "*.so" -o -name "*.so.*" \) \
+        -exec sh -c 'dst="/out/$(basename "$1")"; rm -f "$dst"; cp -P "$1" "$dst"' _ {} \;
 
 # ============================================================================
 # Runtime stage
