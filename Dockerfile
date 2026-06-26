@@ -14,7 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         python3 \
         libvulkan-dev \
-        vulkan-headers \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone the project and initialize the ggml submodule. The build adds ggml
