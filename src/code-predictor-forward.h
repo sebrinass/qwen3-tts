@@ -193,7 +193,9 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
                                KVCache *                    kv,
                                ggml_backend_sched_t         sched,
                                GraphArena *                 arena,
-                               const float *                fresh_input,
+                               struct ggml_tensor *         embd_table,
+                               const float *                hidden_row,
+                               int32_t                      code_id,
                                int                          T,
                                int                          n_past,
                                int                          talker_hidden,
@@ -213,13 +215,28 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
     const int             max_nodes = code_predictor_graph_max_nodes(n_layers);
     struct ggml_context * gctx      = graph_arena_begin(arena);
 
-    // Inputs: fresh embeddings (talker_hidden), positions, attention mask
-    struct ggml_tensor * x_in    = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, talker_hidden, T);
+    // Inputs: one code id gathered in graph from embd_table, positions,
+    // attention mask, plus the raw talker hidden row on the prefill
+    // path (T == 2, hidden_row non NULL) where the sequence is
+    // [talker_hidden, embed(c0)]. Steps (T == 1) are pure gathers: the
+    // only per step upload is 4 bytes of code id.
+    struct ggml_tensor * ids_in  = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, 1);
     struct ggml_tensor * pos_in  = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, T);
     struct ggml_tensor * mask_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, n_kv_pad, T);
-    ggml_set_name(x_in, "sub_input");
+    ggml_set_name(ids_in, "sub_code_id");
     ggml_set_name(pos_in, "positions");
     ggml_set_name(mask_in, "causal_mask");
+    ggml_set_input(ids_in);
+
+    struct ggml_tensor * x_in   = ggml_get_rows(gctx, embd_table, ids_in);
+    struct ggml_tensor * hid_in = NULL;
+    if (T == 2) {
+        hid_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, talker_hidden, 1);
+        ggml_set_name(hid_in, "talker_hidden_row");
+        ggml_set_input(hid_in);
+        x_in = ggml_concat(gctx, hid_in, x_in, 1);
+    }
+    ggml_set_name(x_in, "sub_input");
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);
 
@@ -254,7 +271,10 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
         return false;
     }
 
-    ggml_backend_tensor_set(x_in, fresh_input, 0, (size_t) T * (size_t) talker_hidden * sizeof(float));
+    ggml_backend_tensor_set(ids_in, &code_id, 0, sizeof(int32_t));
+    if (hid_in) {
+        ggml_backend_tensor_set(hid_in, hidden_row, 0, (size_t) talker_hidden * sizeof(float));
+    }
 
     {
         std::vector<int32_t> pos((size_t) T);
@@ -292,30 +312,6 @@ static bool code_predictor_run(const CodePredictorWeights * cw,
 
     kv->cur_len = T_full;
     return true;
-}
-
-// Read one row of an embedding table to f32. Reads from the backend
-// (the predictor weights live there) via ggml_backend_tensor_get,
-// dispatched through ggml_get_type_traits so quants are accepted.
-static void embed_row_from_backend(struct ggml_tensor * t, int row_id, int dim, float * dst) {
-    if (t->ne[0] != dim) {
-        qt_throw("[CodePredictor] embed dim mismatch %lld vs %d", (long long) t->ne[0], dim);
-    }
-    if (row_id < 0 || row_id >= (int) t->ne[1]) {
-        qt_throw("[CodePredictor] row %d out of range (vocab=%lld)", row_id, (long long) t->ne[1]);
-    }
-    const size_t row_bytes = ggml_row_size(t->type, dim);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, dst, (size_t) row_id * row_bytes, row_bytes);
-        return;
-    }
-    const struct ggml_type_traits * tt = ggml_get_type_traits(t->type);
-    if (!tt || !tt->to_float) {
-        qt_throw("[CodePredictor] unsupported embed dtype %d", (int) t->type);
-    }
-    std::vector<uint8_t> tmp(row_bytes);
-    ggml_backend_tensor_get(t, tmp.data(), (size_t) row_id * row_bytes, row_bytes);
-    tt->to_float(tmp.data(), dst, dim);
 }
 
 // Run the predictor for one audio frame. Caller passes the talker hidden
@@ -358,15 +354,14 @@ static bool code_predictor_step(const TalkerWeights *        tw,
     out->codes.assign((size_t) (n_acoustic + 1), 0);
     out->codes[0] = c0;
 
-    // Prefill: two positions, talker_hidden_last and embed_talker(c0).
+    // Prefill: two positions, [talker_hidden_last, embed_talker(c0)].
+    // The hidden row uploads raw, c0 gathers in graph from the talker
+    // codec embedding table.
     kv_cache_reset(kv);
-    std::vector<float> prefill_input((size_t) 2 * (size_t) talker_hidden, 0.0f);
-    std::memcpy(prefill_input.data(), talker_hidden_last, (size_t) talker_hidden * sizeof(float));
-    embed_row_from_backend(tw->codec_embedding, c0, talker_hidden, prefill_input.data() + (size_t) talker_hidden);
 
     std::vector<float> logits;
-    if (!code_predictor_run(cw, kv, sched, arena_prefill, prefill_input.data(), 2, 0, talker_hidden, 0, use_flash_attn,
-                            clamp_fp16, &logits)) {
+    if (!code_predictor_run(cw, kv, sched, arena_prefill, tw->codec_embedding, talker_hidden_last, c0, 2, 0,
+                            talker_hidden, 0, use_flash_attn, clamp_fp16, &logits)) {
         return false;
     }
     {
@@ -385,13 +380,12 @@ static bool code_predictor_step(const TalkerWeights *        tw,
     }
 
     // Decode loop: 14 single-token steps. At step g (g=1..14) we feed
-    // the embedding of the code we just sampled and read lm_head[g].
-    std::vector<float> step_input((size_t) talker_hidden);
+    // the id of the code we just sampled, gathered in graph from the
+    // group's private embedding table, and read lm_head[g].
     for (int g = 1; g < n_acoustic; g++) {
-        embed_row_from_backend(cw->codec_embedding[(size_t) (g - 1)], out->codes[(size_t) g], talker_hidden,
-                               step_input.data());
-        if (!code_predictor_run(cw, kv, sched, arena_step, step_input.data(), 1, kv->cur_len, talker_hidden, g,
-                                use_flash_attn, clamp_fp16, &logits)) {
+        if (!code_predictor_run(cw, kv, sched, arena_step, cw->codec_embedding[(size_t) (g - 1)], NULL,
+                                out->codes[(size_t) g], 1, kv->cur_len, talker_hidden, g, use_flash_attn, clamp_fp16,
+                                &logits)) {
             return false;
         }
         float u_g = 0.0f;

@@ -95,6 +95,10 @@ struct PipelineTTS {
     SpeakerEncoderWeights speaker_encoder;
     bool                  has_speaker_encoder;
 
+    // Speaker encoder weights residency: loaded lazily on the first
+    // reference audio request, see pipeline-tts.cpp.
+    bool spk_enc_loaded;
+
     PipelineCodec codec;
 
     std::string tokenizer_type;
