@@ -139,8 +139,14 @@ curl -X POST localhost:8080/v1/voices -H "Content-Type: application/json" \
          \"spk_b64\":\"$(base64 -w0 ref.spk)\",\"rvq_b64\":\"$(base64 -w0 ref.rvq)\"}"
 
 curl -X POST localhost:8080/v1/audio/speech -H "Content-Type: application/json" \
-    -d '{"input":"Hello world.","voice":"freeman","response_format":"wav"}' -o out.wav
+    -d '{"input":"Hello world.","voice":"freeman","response_format":"wav",
+         "seed":42,"temperature":0.8}' -o out.wav
 ```
+
+The speech body accepts optional sampling overrides (`seed`,
+`max_new_tokens`, `temperature`, `top_k`, `top_p`,
+`repetition_penalty`); unset fields keep the engine defaults and a
+fixed seed makes the request reproducible.
 
 ## Embedding the library
 

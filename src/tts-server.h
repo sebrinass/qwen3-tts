@@ -26,6 +26,7 @@
 #include "audio-io.h"
 #include "yyjson.h"
 
+#include <cfloat>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
@@ -42,6 +43,15 @@ struct tts_request {
     std::string instructions;  // OAI instructions, mapped to the ABI instruct field
     std::string format;        // "pcm" (stream) or "wav" (one-shot)
     float       speed;         // OAI speed, parsed then ignored (no time stretch in the ABI)
+
+    // Optional sampling overrides. -1 (ints) and NaN (floats) mark a
+    // field the client left unset, keeping the engine defaults.
+    int64_t seed;                // forwarded verbatim, -1 draws a random seed
+    int     max_new_tokens;      // strictly positive
+    int     top_k;               // 0 disables the top-k filter
+    float   temperature;         // 0 selects greedy decoding
+    float   top_p;               // in (0, 1]
+    float   repetition_penalty;  // strictly positive
 };
 
 // One voice registration parsed from the POST /v1/voices JSON body.
@@ -165,8 +175,54 @@ static bool tts_parse_request(const std::string & body, tts_request & req, std::
     yyjson_val * speed = yyjson_obj_get(root, "speed");
     req.speed          = yyjson_is_num(speed) ? (float) yyjson_get_num(speed) : 1.0f;
 
+    // Optional sampling overrides. A missing field keeps its unset
+    // marker; a present field must be well typed and in domain.
+    req.seed               = -1;
+    req.max_new_tokens     = -1;
+    req.top_k              = -1;
+    req.temperature        = NAN;
+    req.top_p              = NAN;
+    req.repetition_penalty = NAN;
+
+    auto opt_int = [&](const char * key, int64_t lo, int64_t hi, int64_t & out) -> bool {
+        yyjson_val * v = yyjson_obj_get(root, key);
+        if (!v) {
+            return true;
+        }
+        if (!yyjson_is_int(v) || yyjson_get_sint(v) < lo || yyjson_get_sint(v) > hi) {
+            err = std::string("'") + key + "' is out of domain";
+            return false;
+        }
+        out = yyjson_get_sint(v);
+        return true;
+    };
+    auto opt_num = [&](const char * key, double lo, double hi, float & out) -> bool {
+        yyjson_val * v = yyjson_obj_get(root, key);
+        if (!v) {
+            return true;
+        }
+        if (!yyjson_is_num(v) || yyjson_get_num(v) < lo || yyjson_get_num(v) > hi) {
+            err = std::string("'") + key + "' is out of domain";
+            return false;
+        }
+        out = (float) yyjson_get_num(v);
+        return true;
+    };
+
+    int64_t max_new = -1;
+    int64_t top_k   = -1;
+    bool    ok = opt_int("seed", INT64_MIN, INT64_MAX, req.seed) && opt_int("max_new_tokens", 1, INT32_MAX, max_new) &&
+              opt_int("top_k", 0, INT32_MAX, top_k) && opt_num("temperature", 0.0, FLT_MAX, req.temperature) &&
+              opt_num("top_p", DBL_MIN, 1.0, req.top_p) &&
+              opt_num("repetition_penalty", DBL_MIN, FLT_MAX, req.repetition_penalty);
+    req.max_new_tokens = (int) max_new;
+    req.top_k          = (int) top_k;
+
     yyjson_doc_free(doc);
 
+    if (!ok) {
+        return false;
+    }
     if (req.format != "pcm" && req.format != "wav") {
         err = "response_format must be 'pcm' or 'wav'";
         return false;

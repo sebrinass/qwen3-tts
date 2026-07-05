@@ -626,7 +626,13 @@ Endpoints :
 ```
 POST   /v1/audio/speech   OAI text-to-speech; response_format "pcm"
                           streams s16le 24 kHz mono chunked as it is
-                          generated, "wav" returns a one-shot RIFF file
+                          generated, "wav" returns a one-shot RIFF file.
+                          Optional sampling overrides ride in the same
+                          body: seed, max_new_tokens, temperature,
+                          top_k, top_p, repetition_penalty. Unset
+                          fields keep the engine defaults, temperature
+                          0 selects greedy decoding, the subtalker
+                          mirrors the talker knobs
 GET    /v1/models         single loaded model
 GET    /v1/voices         model speakers plus registered cloned voices
 POST   /v1/voices         register a cloned voice: {name, ref_text,

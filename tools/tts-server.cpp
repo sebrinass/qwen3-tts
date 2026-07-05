@@ -9,6 +9,7 @@
 #include "rvq-file.h"
 #include "version.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -225,6 +226,35 @@ int main(int argc, char ** argv) {
         }
         if (!req.instructions.empty()) {
             p.instruct = req.instructions.c_str();
+        }
+
+        // Sampling overrides ride straight into the ABI; the subtalker
+        // mirrors the talker knobs so the HTTP surface stays a single
+        // coherent set. A temperature of zero selects greedy decoding
+        // on both.
+        p.seed = req.seed;
+        if (req.max_new_tokens != -1) {
+            p.max_new_tokens = req.max_new_tokens;
+        }
+        if (req.top_k != -1) {
+            p.top_k           = req.top_k;
+            p.subtalker_top_k = req.top_k;
+        }
+        if (!std::isnan(req.temperature)) {
+            if (req.temperature == 0.0f) {
+                p.do_sample           = false;
+                p.subtalker_do_sample = false;
+            } else {
+                p.temperature           = req.temperature;
+                p.subtalker_temperature = req.temperature;
+            }
+        }
+        if (!std::isnan(req.top_p)) {
+            p.top_p           = req.top_p;
+            p.subtalker_top_p = req.top_p;
+        }
+        if (!std::isnan(req.repetition_penalty)) {
+            p.repetition_penalty = req.repetition_penalty;
         }
 
         // Trampoline : the C ABI on_chunk forwards to the C++ sink.
