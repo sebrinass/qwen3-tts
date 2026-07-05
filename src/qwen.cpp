@@ -21,6 +21,7 @@
 #include "pipeline-tts.h"
 #include "qt-error.h"
 #include "speaker-encoder-extract.h"
+#include "timer.h"
 #include "version.h"
 
 #include <atomic>
@@ -352,6 +353,20 @@ enum qt_status qt_extract_voice_ref(struct qt_context *   q,
     }
 
     try {
+        // Lazy residency: the first reference audio request pays the
+        // weight load once, mirroring the qt_synthesize ref_audio path.
+        if (!q->pt.spk_enc_loaded) {
+            Timer t_spk_load;
+            if (!speaker_encoder_weights_load(&q->pt.speaker_encoder, q->pt.gguf_talker, q->pt.backend) ||
+                q->pt.speaker_encoder.weight_buf == NULL) {
+                q->pt.has_speaker_encoder = false;
+                qt_set_error("qt_extract_voice_ref: speaker encoder load failed");
+                return QT_STATUS_GENERATE_FAILED;
+            }
+            q->pt.spk_enc_loaded = true;
+            qt_log(QT_LOG_INFO, "[Qwen] Speaker encoder lazy loaded in %.0f ms", t_spk_load.ms());
+        }
+
         std::vector<float> emb;
         if (!speaker_encoder_extract(&q->pt.speaker_encoder, q->pt.sched, ref_audio_24k, ref_n_samples, emb)) {
             qt_set_error("qt_extract_voice_ref: speaker embedding extraction failed");
