@@ -14,8 +14,10 @@
 //   GET  /health            liveness probe
 //
 // Audio out: response_format "pcm" streams s16le 24 kHz mono chunked as it
-// is generated (real time), "wav" returns a one-shot RIFF file. pcm is the
-// default so streaming is on unless the client asks for a file.
+// is generated (real time), "wav" returns a one-shot RIFF file. "wav" is
+// the default so generic HTTP clients (browsers, scripts) get a complete
+// file out of the box; pass response_format="pcm" explicitly for true
+// streaming when the consumer knows the s16le 24 kHz mono framing.
 
 #include "../vendor/cpp-httplib/httplib.h"
 #include "audio-io.h"
@@ -135,7 +137,7 @@ static bool tts_parse_request(const std::string & body, tts_request & req, std::
     req.instructions          = yyjson_is_str(instructions) ? yyjson_get_str(instructions) : "";
 
     yyjson_val * fmt = yyjson_obj_get(root, "response_format");
-    req.format       = yyjson_is_str(fmt) ? yyjson_get_str(fmt) : "pcm";
+    req.format       = yyjson_is_str(fmt) ? yyjson_get_str(fmt) : "wav";
 
     yyjson_val * speed = yyjson_obj_get(root, "speed");
     req.speed          = yyjson_is_num(speed) ? (float) yyjson_get_num(speed) : 1.0f;
