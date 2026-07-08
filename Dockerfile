@@ -35,11 +35,8 @@ RUN git clone --depth 1 "${QWENTTS_REPO}" /src \
     && cd /src \
     && git submodule update --init --recursive --depth 1
 
-# Overlay our modified tts-server.cpp + shared tts-server.h with voice cloning,
-# persistence support, and the wav-on-default response_format for browser-compatible
-# audio out of the box.
+# Overlay our modified tts-server.cpp with voice cloning + persistence support
 COPY tools/tts-server.cpp /src/tools/tts-server.cpp
-COPY src/tts-server.h /src/src/tts-server.h
 
 WORKDIR /src
 
