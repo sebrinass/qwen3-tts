@@ -8,15 +8,15 @@
 // are identical across projects ; only the adapter differs.
 //
 // Endpoints:
-//   POST   /v1/audio/speech   OAI text-to-speech
-//   GET    /v1/models         single loaded model
+//   POST   /v1/audio/speech         OAI text-to-speech
+//   GET    /v1/models               single loaded model
 //   GET    /v1/audio/voices         model speakers plus registered cloned voices
 //   POST   /v1/audio/voices         register a cloned voice: {name, ref_text,
-//                             wav_b64} extracts server side, {name,
-//                             ref_text, spk_b64, rvq_b64} takes
-//                             pre-extracted latents verbatim
+//                                   wav_b64} extracts server side, {name,
+//                                   ref_text, spk_b64, rvq_b64} takes
+//                                   pre-extracted latents verbatim
 //   DELETE /v1/audio/voices/{name}  drop a registered voice
-//   GET    /health            liveness probe
+//   GET    /health                  liveness probe
 //
 // Audio out: response_format "pcm" streams s16le 24 kHz mono chunked as it
 // is generated (real time), "wav" returns a one-shot RIFF file. pcm is the
