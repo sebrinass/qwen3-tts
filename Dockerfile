@@ -27,23 +27,15 @@ RUN git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/s
     && cmake --install /tmp/spirv-headers/build \
     && rm -rf /tmp/spirv-headers
 
-# Clone the project and initialize the ggml submodule. The build adds ggml
-# as a CMake subdirectory, so the submodule must be present. --depth 1 is
-# enough: version.cmake only reads the HEAD commit hash.
-#
-# UPSTREAM_SHA is provided by the CI workflow — it acts as a cache-buster:
-# when the upstream commit changes, this ARG changes, so Docker invalidates
-# the cached layer and actually re-clones the latest code instead of
-# serving the stale cached clone.
-ARG QWENTTS_REPO=https://github.com/ServeurpersoCom/qwentts.cpp.git
-ARG UPSTREAM_SHA=unknown
-RUN echo "Upstream commit: ${UPSTREAM_SHA}" \
-    && git clone --depth 1 "${QWENTTS_REPO}" /src \
+# Clone the fork and initialize the ggml submodule. The build adds ggml as
+# a CMake subdirectory, so the submodule must be present. --depth 1 is
+# enough: version.cmake only reads the HEAD commit hash. The fork's main
+# already carries our voice-cloning tts-server.{h,cpp} pair, so no source
+# overlay is needed — the image is built from the fork's current code.
+ARG QWENTTS_REPO=https://github.com/sebrinass/qwen3-tts.git
+RUN git clone --depth 1 "${QWENTTS_REPO}" /src \
     && cd /src \
     && git submodule update --init --recursive --depth 1
-
-# Overlay our modified tts-server.cpp with voice cloning + persistence support
-COPY tools/tts-server.cpp /src/tools/tts-server.cpp
 
 WORKDIR /src
 
