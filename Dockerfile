@@ -30,8 +30,15 @@ RUN git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/s
 # Clone the project and initialize the ggml submodule. The build adds ggml
 # as a CMake subdirectory, so the submodule must be present. --depth 1 is
 # enough: version.cmake only reads the HEAD commit hash.
+#
+# UPSTREAM_SHA is provided by the CI workflow — it acts as a cache-buster:
+# when the upstream commit changes, this ARG changes, so Docker invalidates
+# the cached layer and actually re-clones the latest code instead of
+# serving the stale cached clone.
 ARG QWENTTS_REPO=https://github.com/ServeurpersoCom/qwentts.cpp.git
-RUN git clone --depth 1 "${QWENTTS_REPO}" /src \
+ARG UPSTREAM_SHA=unknown
+RUN echo "Upstream commit: ${UPSTREAM_SHA}" \
+    && git clone --depth 1 "${QWENTTS_REPO}" /src \
     && cd /src \
     && git submodule update --init --recursive --depth 1
 
