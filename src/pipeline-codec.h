@@ -30,6 +30,8 @@
 #include "encoder-transformer.h"
 #include "ggml-backend.h"
 #include "gguf-weights.h"
+#include "graph-arena.h"
+#include "kv-cache.h"
 #include "quantizer-decode.h"
 #include "quantizer-encode.h"
 #include "seanet-encoder.h"
@@ -43,6 +45,42 @@
 #define TOKENIZER_SAMPLE_RATE   24000
 #define TOKENIZER_NUM_CODEBOOKS 16
 #define TOKENIZER_CODE_BITS     11
+
+// Primed stream state snapshots kept per reference, LRU evicted.
+static const int CODEC_SNAP_SLOTS = 8;
+
+// Chunk width classes of the streaming decode: T in {1, 2, 4, 8}.
+static const int CODEC_STREAM_CLASSES = 4;
+
+// One static stream graph of chunk width T: built once, allocated
+// once, replayed with per chunk uploads of codes, positions, ring
+// rows, and the sliding window mask.
+struct CodecStreamGraph {
+    struct ggml_context * ctx    = nullptr;
+    struct ggml_cgraph *  gf     = nullptr;
+    ggml_gallocr_t        galloc = nullptr;
+    struct ggml_tensor *  codes  = nullptr;
+    struct ggml_tensor *  pos    = nullptr;
+    struct ggml_tensor *  rows   = nullptr;
+    struct ggml_tensor *  mask   = nullptr;
+    struct ggml_tensor *  out    = nullptr;
+    std::vector<int32_t>  pos_buf;
+    std::vector<int64_t>  rows_buf;
+    std::vector<float>    mask_buf;
+};
+
+// One primed stream state snapshot: a mirror of every conv context and
+// KV ring tensor in a single backend buffer, plus the host position
+// cursor. key is the content hash of the reference codes, stamp orders
+// the slots for LRU eviction, stamp zero marks an empty slot. Mirrors
+// allocate lazily on the slot's first save.
+struct CodecStateSnap {
+    uint64_t              key;
+    uint64_t              stamp;
+    int                   pos;
+    struct ggml_context * ctx;
+    ggml_backend_buffer_t buf;
+};
 
 struct PipelineCodec {
     GGUFModel gguf;
@@ -63,7 +101,50 @@ struct PipelineCodec {
     QwenSEANetEncoder      seanet;
     QwenEncoderTransformer enc_transformer;
     QwenEncoderDownsample  enc_downsample;
-    QwenQuantizerEncode    qenc;
+
+    // Encoder weights (seanet, enc_transformer, enc_downsample, qenc)
+    // load lazily on the first pipeline_codec_encode call: synthesis
+    // from pre encoded reference codes never pays for them.
+    bool                enc_loaded;
+    QwenQuantizerEncode qenc;
+
+    // Persistent graph arena for pipeline_codec_decode: stable node
+    // addresses across rebuilds keep the backend CUDA graph cache hot,
+    // so constant size streaming slices replay a captured executable.
+    GraphArena dec_arena;
+
+    // Stateful streaming decoder: every causal conv left context, every
+    // transposed conv overlap carry, and the transformer sliding window
+    // KV ring live as backend resident tensors, so a T=1 frame decode
+    // reproduces the offline full decode exactly with zero re-decoded
+    // context. Loaded lazily on the first pipeline_codec_stream_reset:
+    // the buffered chunked path never pays for it.
+    bool                    stream_ready;
+    struct ggml_context *   stream_ctx;
+    ggml_backend_buffer_t   stream_buf;
+    struct ggml_tensor *    stream_pre_conv;  // pre_conv k=3, [2, 512]
+    QwenUpsampleStreamState stream_up;
+    QwenDACStreamState      stream_dac;
+    KVCache                 stream_kv;   // tok transformer ring, [hd, ring, n_kv] per layer
+    int                     stream_pos;  // absolute frame position, drives RoPE and ring slots
+
+    // Static frame graph: the T=1 topology and every tensor address are
+    // constant, so the graph builds and allocates once and every frame
+    // is input uploads + one backend compute + one readback. The single
+    // backend runs the whole graph, no scheduler involved.
+    // Static stream graphs, one per chunk width class (T = 1 << cls).
+    // Every class shares the stream state and KV ring tensors above;
+    // only the input shapes and the intermediates differ. Classes
+    // build lazily on their first decode.
+    CodecStreamGraph stream_graphs[CODEC_STREAM_CLASSES];
+
+    // Snapshot LRU over the stream state: after an ICL reference
+    // priming the conv contexts, KV ring, and position copy device to
+    // device into the slot keyed by the reference content hash, so a
+    // repeated reference restores in one pass of tensor copies instead
+    // of re-decoding every reference frame.
+    CodecStateSnap snaps[CODEC_SNAP_SLOTS];
+    uint64_t       snap_stamp;
 
     // CPU mirror of the RVQ encode side, lazy-loaded on first encode call.
     QwenQuantizerEncodeHost qenc_sem_host;
@@ -79,10 +160,43 @@ struct PipelineCodec {
 // On failure leaves the struct in a clean state and returns false.
 bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp);
 
+// Load the encoder weights on demand. Idempotent, called by
+// pipeline_codec_encode; harmless to call when already resident.
+bool pipeline_codec_ensure_encoder(PipelineCodec * pc);
+
 // Decode RVQ codes into a 24 kHz mono waveform.
 //   codes: flat int32 buffer, [K, T] row-major (T fastest).
 // Returns audio of length T * TOKENIZER_HOP_LENGTH, empty on failure.
 std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * codes, int K, int T);
+
+// Reset the stateful streaming decoder to the zero context: allocates
+// the state tensors on first call, clears every conv left context,
+// transposed conv carry, and the transformer KV ring, and rewinds the
+// absolute position. Call once before each streamed utterance.
+bool pipeline_codec_stream_reset(PipelineCodec * pc);
+
+// Decode one frame through the stateful streaming path. codes holds the
+// K codebook entries of a single frame; the persistent state advances
+// as a side effect. When audio_out is non NULL the frame's
+// TOKENIZER_HOP_LENGTH samples copy into it; a NULL audio_out primes
+// the state without a readback (ICL reference priming).
+// Decode one chunk of T frames (T in {1, 2, 4, 8}) through the
+// persistent stream state. codes is [T, K] with T contiguous per
+// codebook; audio_out receives T * TOKENIZER_HOP_LENGTH samples, NULL
+// discards the audio (reference priming).
+bool pipeline_codec_decode_stream(PipelineCodec * pc, const int32_t * codes, int T, float * audio_out);
+
+// Content hash of an ICL reference, the snapshot LRU key.
+//   codes: flat int32, [K, T] row-major.
+uint64_t pipeline_codec_ref_key(const int32_t * codes, int K, int T);
+
+// Restore the stream state from the snapshot slot matching key.
+// Returns false on a miss; the caller then primes and snapshots.
+bool pipeline_codec_stream_restore(PipelineCodec * pc, uint64_t key);
+
+// Save the current stream state into the LRU slot for key, evicting
+// the least recently used slot when all are taken.
+bool pipeline_codec_stream_snapshot(PipelineCodec * pc, uint64_t key);
 
 // Encode a 24 kHz mono waveform into RVQ codes.
 //   audio    : [n_samples] f32 mono 24 kHz. Must be a multiple of

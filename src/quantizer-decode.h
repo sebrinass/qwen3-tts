@@ -164,3 +164,36 @@ static struct ggml_tensor * quant_decode(struct ggml_context *        ctx,
 
     return ggml_add(ctx, h_sem, h_aco);
 }
+
+// Streaming variant for the static frame graph computed directly on the
+// backend, without the scheduler's per view input duplication: every
+// codebook id passes through a ggml_cont so the get_rows sources land
+// on allocator aligned tensors, which the Vulkan get_rows path
+// requires. Same math and structure as quant_decode.
+static struct ggml_tensor * rvq_group_decode_stream(struct ggml_context * ctx,
+                                                    const QwenRVQGroup &  g,
+                                                    struct ggml_tensor *  codes_split,
+                                                    int                   T) {
+    struct ggml_tensor * sum = NULL;
+    for (int k = 0; k < g.num_codebooks; k++) {
+        struct ggml_tensor * idx = ggml_cont(ctx, ggml_view_1d(ctx, codes_split, T, (size_t) k * codes_split->nb[1]));
+        struct ggml_tensor * emb = ggml_get_rows(ctx, g.embed[(size_t) k], idx);
+        sum                      = (sum == NULL) ? emb : ggml_add(ctx, sum, emb);
+    }
+    return ggml_mul_mat(ctx, g.out_proj_w, sum);
+}
+
+static struct ggml_tensor * quant_decode_stream(struct ggml_context *        ctx,
+                                                const QwenQuantizerDecoder * dec,
+                                                struct ggml_tensor *         codes) {
+    int T = (int) codes->ne[0];
+
+    struct ggml_tensor * codes_sem = ggml_view_2d(ctx, codes, T, dec->num_semantic_quantizers, codes->nb[1], 0);
+    size_t               aco_off   = (size_t) dec->num_semantic_quantizers * codes->nb[1];
+    struct ggml_tensor * codes_aco = ggml_view_2d(ctx, codes, T, dec->num_acoustic_quantizers, codes->nb[1], aco_off);
+
+    struct ggml_tensor * h_sem = rvq_group_decode_stream(ctx, dec->semantic, codes_sem, T);
+    struct ggml_tensor * h_aco = rvq_group_decode_stream(ctx, dec->acoustic, codes_aco, T);
+
+    return ggml_add(ctx, h_sem, h_aco);
+}

@@ -20,7 +20,7 @@
 //     fits in a single chunk_frames sized window. Bounds VRAM beyond
 //     that, mirrors the upstream chunked_decode loop frame for frame.
 //
-//   codec_chunked_decoder_stream : rolling state for AR streaming.
+//   codec_stream_decoder : stateful frame by frame AR streaming.
 //     The pipeline pushes one frame at a time as the talker produces
 //     them ; push_frame decodes and emits a fresh chunk_frames sized
 //     audio block through the on_chunk callback as soon as enough new
@@ -84,86 +84,128 @@ static inline std::vector<float> codec_chunked_decode(PipelineCodec * pc,
     return out;
 }
 
-// Rolling streaming decoder. Stores codes K major as K parallel vectors
-// (by_k[k][t]) so emit_one can memcpy a contiguous K major slice into
-// pipeline_codec_decode without a transpose. push_frame triggers as
-// many emits as possible after appending one frame ; flush emits the
-// tail at EOS.
-struct codec_chunked_decoder_stream {
-    std::vector<std::vector<int32_t>> by_k;
-    int                               K;
-    int                               T_so_far;
-    int                               chunk_frames;
-    int                               left_ctx_frames;
-    int                               emit_start_frame;
-    // Set true when an emit returned false because the on_chunk callback
-    // requested a cancel. Stays false on decode failures so the caller
-    // can route to QT_STATUS_CANCELLED vs QT_STATUS_GENERATE_FAILED on
-    // a push_frame / flush negative return.
-    bool                              cancelled;
+// Stateful streaming decoder over pipeline_codec_decode_stream with an
+// adaptive chunk ramp: the first pushed frame decodes immediately for
+// the lowest first byte latency, then chunks grow 2 -> 4 -> 8 frames so
+// the steady state interleaves the codec with the talker 8x less often
+// and the batch amortizes the kernel count. drain flushes the sub chunk
+// tail at EOS with greedy width classes. ICL priming feeds the full
+// reference through the same state in max width chunks with the audio
+// discarded.
+struct codec_stream_decoder {
+    int  K;
+    // Set true when a flush returned false because the on_chunk
+    // callback requested a cancel. Stays false on decode failures so
+    // the caller can route to QT_STATUS_CANCELLED vs
+    // QT_STATUS_GENERATE_FAILED on a negative return.
+    bool cancelled;
 
-    void init(int K_, int chunk_frames_, int left_ctx_frames_) {
-        K                = K_;
-        T_so_far         = 0;
-        chunk_frames     = chunk_frames_ < 1 ? 1 : chunk_frames_;
-        left_ctx_frames  = left_ctx_frames_ < 0 ? 0 : left_ctx_frames_;
-        emit_start_frame = 0;
-        cancelled        = false;
-        by_k.assign((size_t) K, {});
+    static const int MAX_CHUNK = 1 << (CODEC_STREAM_CLASSES - 1);
+
+    int                  target;     // current ramp chunk width
+    int                  pending_n;  // frames accumulated, < target
+    std::vector<int32_t> pending;    // [MAX_CHUNK, K] frame major
+    std::vector<int32_t> scratch;    // [T, K] chunk upload layout
+    std::vector<float>   frame;      // [MAX_CHUNK * hop] audio out
+
+    // Reset the persistent codec state to the zero context and restart
+    // the chunk ramp. Returns false when the state allocation fails.
+    bool init(PipelineCodec * pc, int K_) {
+        K         = K_;
+        cancelled = false;
+        target    = 1;
+        pending_n = 0;
+        pending.assign((size_t) MAX_CHUNK * (size_t) K, 0);
+        scratch.assign((size_t) MAX_CHUNK * (size_t) K, 0);
+        frame.assign((size_t) MAX_CHUNK * (size_t) TOKENIZER_HOP_LENGTH, 0.0f);
+        return pipeline_codec_stream_reset(pc);
     }
 
-    // Append one frame (K int32 codes, one per codebook). Drain any
-    // chunks that became emittable. Returns false on decode failure or
-    // when cb returns false (cancellation).
-    bool push_frame(PipelineCodec * pc, const int32_t * frame_codes, qt_audio_chunk_cb cb, void * cb_ud) {
+    // Decode and emit the first T pending frames, then compact the
+    // remainder to the front. The scratch reorders frame major pending
+    // rows into the [T, K] chunk layout (T contiguous per codebook).
+    bool flush_front(PipelineCodec * pc, int T, qt_audio_chunk_cb cb, void * cb_ud) {
         for (int k = 0; k < K; k++) {
-            by_k[(size_t) k].push_back(frame_codes[k]);
-        }
-        T_so_far++;
-
-        while (T_so_far - emit_start_frame >= chunk_frames) {
-            if (!emit_one(pc, emit_start_frame + chunk_frames, cb, cb_ud)) {
-                return false;
+            for (int t = 0; t < T; t++) {
+                scratch[(size_t) k * (size_t) T + (size_t) t] = pending[(size_t) t * (size_t) K + (size_t) k];
             }
         }
-        return true;
-    }
-
-    // Drain the tail. If frames remain past emit_start_frame, decode
-    // them with left context and emit one final short chunk. Idempotent
-    // on empty tail.
-    bool flush(PipelineCodec * pc, qt_audio_chunk_cb cb, void * cb_ud) {
-        if (T_so_far > emit_start_frame) {
-            return emit_one(pc, T_so_far, cb, cb_ud);
-        }
-        return true;
-    }
-
-  private:
-    // Decode [emit_start_frame - ctx .. end_frame] with left context
-    // stripped from the emitted samples, then advance emit_start_frame.
-    bool emit_one(PipelineCodec * pc, int end_frame, qt_audio_chunk_cb cb, void * cb_ud) {
-        int ctx         = (emit_start_frame - left_ctx_frames > 0) ? left_ctx_frames : emit_start_frame;
-        int slice_start = emit_start_frame - ctx;
-        int slice_T     = end_frame - slice_start;
-
-        std::vector<int32_t> slice((size_t) K * (size_t) slice_T);
-        for (int k = 0; k < K; k++) {
-            std::memcpy(slice.data() + (size_t) k * (size_t) slice_T, by_k[(size_t) k].data() + (size_t) slice_start,
-                        (size_t) slice_T * sizeof(int32_t));
-        }
-        std::vector<float> wav = pipeline_codec_decode(pc, slice.data(), K, slice_T);
-        if (wav.empty()) {
+        if (!pipeline_codec_decode_stream(pc, scratch.data(), T, frame.data())) {
             return false;
         }
-        const size_t  drop       = (size_t) ctx * (size_t) TOKENIZER_HOP_LENGTH;
-        const float * emit_first = wav.data() + drop;
-        int           emit_n     = (int) (wav.size() - drop);
-        if (emit_n > 0 && !cb(emit_first, emit_n, cb_ud)) {
+        if (cb && !cb(frame.data(), T * TOKENIZER_HOP_LENGTH, cb_ud)) {
             cancelled = true;
             return false;
         }
-        emit_start_frame = end_frame;
+        pending_n -= T;
+        if (pending_n > 0) {
+            std::memmove(pending.data(), pending.data() + (size_t) T * (size_t) K,
+                         (size_t) pending_n * (size_t) K * sizeof(int32_t));
+        }
+        return true;
+    }
+
+    // Prime the codec state with the full ICL reference: every frame
+    // runs through the streaming decode in max width chunks with the
+    // audio discarded, so the first generated frame sees the
+    // reference's exact causal state. A reference already primed
+    // restores its snapshot device to device instead of re-decoding; a
+    // fresh one saves its primed state into the LRU. ref_kt is K major
+    // [K, ref_T]. Call once, after init and before any push_frame.
+    bool seed_reference(PipelineCodec * pc, const int32_t * ref_kt, int ref_T) {
+        const uint64_t key = pipeline_codec_ref_key(ref_kt, K, ref_T);
+        if (pipeline_codec_stream_restore(pc, key)) {
+            return true;
+        }
+        int t0 = 0;
+        while (t0 < ref_T) {
+            int T = MAX_CHUNK;
+            while (T > ref_T - t0) {
+                T >>= 1;
+            }
+            for (int k = 0; k < K; k++) {
+                for (int t = 0; t < T; t++) {
+                    scratch[(size_t) k * (size_t) T + (size_t) t] =
+                        ref_kt[(size_t) k * (size_t) ref_T + (size_t) (t0 + t)];
+                }
+            }
+            if (!pipeline_codec_decode_stream(pc, scratch.data(), T, NULL)) {
+                return false;
+            }
+            t0 += T;
+        }
+        return pipeline_codec_stream_snapshot(pc, key);
+    }
+
+    // Accumulate one frame (K int32 codes, one per codebook) and decode
+    // when the ramp chunk fills. Returns false on decode failure or
+    // when cb returns false (cancellation).
+    bool push_frame(PipelineCodec * pc, const int32_t * frame_codes, qt_audio_chunk_cb cb, void * cb_ud) {
+        std::memcpy(pending.data() + (size_t) pending_n * (size_t) K, frame_codes, (size_t) K * sizeof(int32_t));
+        pending_n++;
+        if (pending_n < target) {
+            return true;
+        }
+        if (!flush_front(pc, target, cb, cb_ud)) {
+            return false;
+        }
+        if (target < MAX_CHUNK) {
+            target <<= 1;
+        }
+        return true;
+    }
+
+    // Flush the sub chunk tail at EOS through greedy width classes.
+    bool drain(PipelineCodec * pc, qt_audio_chunk_cb cb, void * cb_ud) {
+        while (pending_n > 0) {
+            int T = MAX_CHUNK;
+            while (T > pending_n) {
+                T >>= 1;
+            }
+            if (!flush_front(pc, T, cb, cb_ud)) {
+                return false;
+            }
+        }
         return true;
     }
 };

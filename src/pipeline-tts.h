@@ -11,13 +11,16 @@
 // directly so the facade in qwen.cpp stays a thin wrapper.
 
 #include "backend.h"
+#include "code-predictor-graph.h"
 #include "code-predictor-weights.h"
 #include "ggml-backend.h"
 #include "gguf-weights.h"
+#include "graph-arena.h"
 #include "kv-cache.h"
 #include "pipeline-codec.h"
 #include "qwen.h"
 #include "speaker-encoder-weights.h"
+#include "talker-decode-graph.h"
 #include "talker-weights.h"
 
 #include <cstdint>
@@ -94,6 +97,10 @@ struct PipelineTTS {
     SpeakerEncoderWeights speaker_encoder;
     bool                  has_speaker_encoder;
 
+    // Speaker encoder weights residency: loaded lazily on the first
+    // reference audio request, see pipeline-tts.cpp.
+    bool spk_enc_loaded;
+
     PipelineCodec codec;
 
     std::string tokenizer_type;
@@ -126,6 +133,25 @@ struct PipelineTTS {
     // frame in code_predictor_step.
     KVCache talker_kv;
     KVCache code_predictor_kv;
+
+    // Hidden bridge: the talker last position hidden stays resident on
+    // device. The talker graph copies it in, the code predictor prefill
+    // graph reads it as a leaf, so the AR hot loop never round trips
+    // the row through the host. [talker_hidden] f32 on `backend`.
+    struct ggml_context * bridge_ctx;
+    ggml_backend_buffer_t bridge_buf;
+    struct ggml_tensor *  hidden_bridge;
+
+    // Persistent graph arena for the talker prefill (T_ctx varies per
+    // request, rebuilt through the sched). The talker decode and the
+    // whole predictor run on static graphs instead: the decode keeps
+    // one graph per attention window class built lazily, the predictor
+    // one prefill (T=2) plus one per acoustic step built at load, all
+    // replayed directly on the backend.
+    GraphArena                     talker_arena;
+    std::vector<TalkerDecodeGraph> talker_decode_graphs;  // one per 256 step window class, lazy
+    CodePredGraph                  cp_prefill_graph;
+    std::vector<CodePredGraph>     cp_step_graphs;
 };
 
 // Open the talker GGUF and the codec GGUF, load every module on the

@@ -200,3 +200,92 @@ static struct ggml_tensor * qwen_causal_conv1d(struct ggml_context * ctx,
     }
     return y;
 }
+
+// Streaming causal Conv1d, stride 1. The offline zero left pad is
+// replaced by a persistent state tensor carrying the last (k-1)*d input
+// rows across calls: the graph concats the state ahead of the fresh
+// rows, runs a pad free conv, and refreshes the state in graph with the
+// tail of the extended input. The state is [(k-1)*d, IC] f32, backend
+// resident and zero cleared at stream reset, so the first call matches
+// the offline zero pad bit for bit. The state write depends on the
+// concat output, so it always executes after the read.
+//   w: [k, IC, OC] f32, x: [T, IC] f32 T-first
+// Returns [T, OC] f32 T-first.
+static struct ggml_tensor * qwen_causal_conv1d_stream(struct ggml_context * ctx,
+                                                      struct ggml_cgraph *  gf,
+                                                      struct ggml_tensor *  w,
+                                                      struct ggml_tensor *  b,
+                                                      struct ggml_tensor *  x,
+                                                      int                   k,
+                                                      int                   d,
+                                                      struct ggml_tensor *  state) {
+    int OC = (int) w->ne[2];
+    int L  = (k - 1) * d;
+
+    struct ggml_tensor * x_ext = ggml_concat(ctx, state, x, 0);  // [L + T, IC]
+
+    // State refresh: the last L rows of x_ext feed the next call.
+    struct ggml_tensor * tail =
+        ggml_view_2d(ctx, x_ext, L, x_ext->ne[1], x_ext->nb[1], (size_t) (x_ext->ne[0] - L) * x_ext->nb[0]);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, tail, state));
+
+    struct ggml_tensor * y = ggml_reshape_3d(ctx, x_ext, x_ext->ne[0], x_ext->ne[1], 1);
+    y                      = ggml_conv_1d(ctx, w, y, 1, 0, d);
+    y                      = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1]);
+
+    if (b) {
+        struct ggml_tensor * b2d = ggml_reshape_2d(ctx, b, 1, OC);
+        y                        = ggml_add(ctx, y, b2d);
+    }
+    return y;
+}
+
+// Streaming causal ConvTranspose1d. The raw col2im output spans
+// (T-1)*stride + K rows; the offline path right trims K - stride of
+// them, the streaming path instead carries that tail into the next
+// call: the persistent carry [K - stride, OC] adds onto the head of the
+// raw output and refreshes with the raw tail, bias free (the bias
+// applies once, on the emitted rows). The carry consumer expands before
+// the carry write so the read always precedes the overwrite.
+//   w_perm: [IC, K*OC] f32 from qwen_load_ctw_f32, x: [T, IC] f32 T-first
+// Returns [T*stride, OC] f32 T-first.
+static struct ggml_tensor * qwen_causal_trans_conv1d_stream(struct ggml_context * ctx,
+                                                            struct ggml_cgraph *  gf,
+                                                            struct ggml_tensor *  w_perm,
+                                                            struct ggml_tensor *  b,
+                                                            struct ggml_tensor *  x,
+                                                            int                   stride,
+                                                            int                   kernel,
+                                                            int                   oc,
+                                                            struct ggml_tensor *  carry) {
+    int T    = (int) x->ne[0];
+    int trim = kernel - stride;
+    int emit = T * stride;
+
+    struct ggml_tensor * xt  = ggml_cont(ctx, ggml_transpose(ctx, x));
+    struct ggml_tensor * col = ggml_mul_mat(ctx, w_perm, xt);
+
+    // Raw scatter [(T-1)*stride + K, OC] = [emit + trim, OC]
+    struct ggml_tensor * raw = ggml_col2im_1d(ctx, col, stride, oc, 0);
+
+    // Head rows [0, trim) receive the previous call's tail.
+    struct ggml_tensor * head = ggml_view_2d(ctx, raw, trim, raw->ne[1], raw->nb[1], 0);
+    struct ggml_tensor * y    = ggml_add(ctx, head, carry);
+    if (emit > trim) {
+        struct ggml_tensor * mid =
+            ggml_view_2d(ctx, raw, emit - trim, raw->ne[1], raw->nb[1], (size_t) trim * raw->nb[0]);
+        y = ggml_concat(ctx, y, mid, 0);
+    }
+    ggml_build_forward_expand(gf, y);
+
+    // Carry refresh with the raw tail [emit, emit + trim), expanded
+    // after the head sum so the carry read wins the ordering.
+    struct ggml_tensor * tail = ggml_view_2d(ctx, raw, trim, raw->ne[1], raw->nb[1], (size_t) emit * raw->nb[0]);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, tail, carry));
+
+    if (b) {
+        struct ggml_tensor * b2d = ggml_reshape_2d(ctx, b, 1, oc);
+        y                        = ggml_add(ctx, y, b2d);
+    }
+    return y;
+}
